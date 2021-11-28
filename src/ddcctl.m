@@ -160,6 +160,58 @@ void getSetControl(io_service_t framebuffer, uint control_id, NSString *new_valu
     setControl(framebuffer, control_id, (uint) clamped_value);
 }
 
+BOOL TestSerialMatch(CGDirectDisplayID cdisplay, NSString *expect_serial)
+{
+    io_service_t framebuffer = 0;
+    NSString *devLoc = getDisplayDeviceLocation(cdisplay);
+    #pragma clang diagnostic push
+    #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            if (CGDisplayIOServicePort != NULL) {
+                // legacy API call to get the IOFB's service port, was deprecated after macOS 10.9:
+                //     https://developer.apple.com/library/mac/documentation/GraphicsImaging/Reference/Quartz_Services_Ref/index.html#//apple_ref/c/func/CGDisplayIOServicePort
+                framebuffer = CGDisplayIOServicePort(cdisplay);
+    #pragma clang diagnostic pop
+            }
+    if (! framebuffer && devLoc) {
+        // a devLoc is required because, without that IOReg path, this func is prone to always match the 1st device of a monitor-pair (#17)
+        framebuffer = IOFramebufferPortFromCGDisplayID(cdisplay, (__bridge CFStringRef)devLoc);
+    }
+
+    if (! framebuffer) {
+        MyLog(@"E: Failed to acquire framebuffer device for display");
+        return NO;
+    }
+
+    struct EDID edid = {};
+    NSString *edid_serial = @"";
+    NSString *screenName = @"";
+    if (EDIDTest(framebuffer, &edid)) {
+        for (union descriptor *des = edid.descriptors; des < edid.descriptors + sizeof(edid.descriptors) / sizeof(edid.descriptors[0]); des++) {
+            switch (des->text.type)
+            {
+                case 0xFF:
+                    edid_serial = EDIDString(des->text.data);
+                    // MyLog(@"I: got edid.serial: %@", EDIDString(des->text.data));
+                    break;
+                case 0xFC:
+                    screenName = EDIDString(des->text.data);
+                    // MyLog(@"I: got edid.name: %@", screenName);
+                    break;
+            }
+        }
+    } else {
+        MyLog(@"E: Failed to poll display!");
+        IOObjectRelease(framebuffer);
+        return NO;
+    }
+    
+    if ([edid_serial isEqual:expect_serial]) {
+        return YES;
+    }
+
+    return NO;
+}
+
 /* Main function */
 int main(int argc, const char * argv[])
 {
@@ -182,6 +234,7 @@ int main(int argc, const char * argv[])
                 CGSize displayPhysicalSize = CGDisplayScreenSize(screenNumber); // dspPhySz only valid if EDID present!
                 float displayScale = [screen backingScaleFactor];
                 double rotation = CGDisplayRotation(screenNumber);
+                #if 1
                 if (displayScale > 1) {
                     MyLog(@"D: CGDisplay %@ dispID(#%u) (%.0fx%.0f %g°) HiDPI",
                           screenUUIDstr,
@@ -199,6 +252,7 @@ int main(int argc, const char * argv[])
                           rotation,
                           (displayPixelSize.width / displayPhysicalSize.width) * 25.4f); // there being 25.4 mm in an inch
                 }
+                #endif
 
 #ifdef DEBUG
                 NSString *devLoc = getDisplayDeviceLocation(screenNumber);
@@ -208,17 +262,22 @@ int main(int argc, const char * argv[])
 #endif
             }
         }
-        MyLog(@"I: found %lu external display%@", [_displayIDs count], [_displayIDs count] > 1 ? @"s" : @"");
-
+        NSUInteger displayCount = [_displayIDs count];
+        
+        // MyLog(@"I: hsong customed version for two dell 4k display, total found: %lu", displayCount);
 
         // Defaults
         NSString *screenName = @"";
+        NSString *displaySerial = @"";
         NSUInteger displayId = -1;
         NSUInteger command_interval = 100000;
         BOOL dump_values = NO;
+        BOOL actionSwitchInputSouce = NO;
+        BOOL actionCount = NO;
 
         NSString *HelpString = @"Usage:\n"
         @"ddcctl \t-d <1-..>  [display#]\n"
+        @"\t-s STRING  [edid.serial value for verify]\n"
         @"\t-w <0-..>  [delay in usecs between settings]\n"
         @"\t-W <0-..>  [timeout in nanosecs for replies]\n"
         @"\n"
@@ -259,6 +318,17 @@ int main(int argc, const char * argv[])
                 i++;
                 if (i >= argc) break;
                 displayId = atoi(argv[i]);
+            }
+
+            else if (!strcmp(argv[i], "-l")) {
+                actionCount = YES;
+                break;
+            }
+
+            else if (!strcmp(argv[i], "-s")) {
+                i++;
+                if (i >= argc) break;
+                displaySerial = [[NSString alloc] initWithUTF8String:argv[i]];
             }
 
             else if (!strcmp(argv[i], "-b")) {
@@ -346,12 +416,14 @@ int main(int argc, const char * argv[])
             else if (!strcmp(argv[i], "-i")) {
                 i++;
                 if (i >= argc) break;
+                actionSwitchInputSouce = YES;
                 [actions setObject:@[@INPUT_SOURCE, [[NSString alloc] initWithUTF8String:argv[i]]] forKey:@"i"];
             }
 
             else if (!strcmp(argv[i], "-m")) {
                 i++;
                 if (i >= argc) break;
+                actionSwitchInputSouce = YES;
                 [actions setObject:@[@AUDIO_MUTE, [[NSString alloc] initWithUTF8String:argv[i]]] forKey:@"m"];
             }
 
@@ -399,15 +471,58 @@ int main(int argc, const char * argv[])
                 return -1;
             }
         }
+        if (actionCount) {
+            if (displayCount) {
+                return 0;
+            }
+            return -1;
+        }
+
+        MyLog(@"I: found %lu external display%@", displayCount, displayCount > 1 ? @"s" : @"");
 
         if (0 >= displayId || displayId > [_displayIDs count]) {
             // no display id given, nothing left to do!
-            NSLog(@"%@", HelpString);
-            exit(1);
+            if (!actionSwitchInputSouce && !actionCount) {
+                // MyLog(@"here: %d", actionCount);
+                NSLog(@"%@", HelpString);
+                exit(1);
+            }
+
+            if (displayCount > 0) {
+                displayId = 1;
+            }
+            else {
+                MyLog(@"E: %lu display found", displayCount);
+                return 0;
+            }
+
         }
 
-        CGDirectDisplayID cdisplay = (CGDirectDisplayID)[_displayIDs pointerAtIndex:displayId - 1];
+        if (displayCount < 1){
+            MyLog(@"E: %lu display found", displayCount);
+            return 0;
+        }
 
+        if (displaySerial.length){
+            for (int i=1; i<=[_displayIDs count]; i++) {
+                CGDirectDisplayID tmp = (CGDirectDisplayID)[_displayIDs pointerAtIndex:i - 1];
+                BOOL test_ret = TestSerialMatch(tmp, displaySerial);
+                MyLog(@" match: %d", test_ret);
+                if (test_ret) {
+                    MyLog(@" match result: %d, decide display id: %d", test_ret, i);
+                    displayId = i;
+                    break;
+                }
+            }
+            if (displayId <= 0) {
+                MyLog(@" match failed for: %@", displaySerial);
+                return -1;
+            }
+        }
+        
+
+        CGDirectDisplayID cdisplay = (CGDirectDisplayID)[_displayIDs pointerAtIndex:displayId - 1];
+ 
         // find & grab the IOFramebuffer for the display, the IOFB is where DDC/I2C commands are sent
         io_service_t framebuffer = 0;
         NSString *devLoc = getDisplayDeviceLocation(cdisplay);
@@ -433,11 +548,13 @@ int main(int argc, const char * argv[])
         MyLog(@"I: polling EDID for #%lu (ID %u => %@)", displayId, cdisplay, devLoc);
 
         struct EDID edid = {};
+        NSString *edid_serial = @"";
         if (EDIDTest(framebuffer, &edid)) {
             for (union descriptor *des = edid.descriptors; des < edid.descriptors + sizeof(edid.descriptors) / sizeof(edid.descriptors[0]); des++) {
                 switch (des->text.type)
                 {
                     case 0xFF:
+                        edid_serial = EDIDString(des->text.data);
                         MyLog(@"I: got edid.serial: %@", EDIDString(des->text.data));
                         break;
                     case 0xFC:
@@ -451,6 +568,38 @@ int main(int argc, const char * argv[])
             IOObjectRelease(framebuffer);
             return -1;
         }
+
+        if (actionCount) {
+            MyLog(@"I: do count!");
+            return 0;
+        }
+
+        // MyLog(@"input serial: %@, len: %lu", displaySerial, displaySerial.length);
+        /*if (displaySerial.length){
+            if (![edid_serial isEqual:displaySerial]){
+                MyLog(@"serial not match. current: %@, expect: %@", displaySerial, edid_serial);
+                IOObjectRelease(framebuffer);
+                return -1;
+            }
+            else {
+                MyLog(@"I: serial match");
+            }
+        }
+        else {
+            NSString *display_serial[2] = {@"DX97Z13", @"5DWRH7BL0DDL"};
+            
+            if (![edid_serial isEqual:display_serial[displayId-1]]) {
+                MyLog(@"E: Display id <%lu> and edid.serial does match (ok: %@), current: %@", displayId, display_serial[displayId-1], edid_serial);
+                IOObjectRelease(framebuffer);
+                return -1;
+            }
+            else {
+                MyLog(@"I: serial match as build in");
+            }
+        }*/
+
+        MyLog(@"I: id: %lu, serial: %@", displayId, displaySerial);
+        // return 0;
 
         // Debugging
         if (dump_values) {
